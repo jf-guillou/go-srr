@@ -42,7 +42,7 @@ func New(f *os.File) (*SRR, error) {
 
 	// Peek at first block
 	header, err := srr.ReadBlockHeader()
-	if header.BlockType() != BlockTypeSRRHeader {
+	if header.BlockType != BlockTypeSRRHeader {
 		return nil, errors.New("File is not a valid SRR archive")
 	}
 
@@ -83,7 +83,8 @@ func (r *SRR) ReadBlock() (Block, error) {
 }
 
 // ReadBlockHeader reads block header
-func (r *SRR) ReadBlockHeader() (BlockHeader, error) {
+func (r *SRR) ReadBlockHeader() (*BlockHeader, error) {
+
 	var crc uint16
 	if err := binary.Read(r.Reader, binary.LittleEndian, &crc); err != nil {
 		return nil, err
@@ -96,49 +97,35 @@ func (r *SRR) ReadBlockHeader() (BlockHeader, error) {
 	if err := binary.Read(r.Reader, binary.LittleEndian, &flags); err != nil {
 		return nil, err
 	}
-	var payloadLength uint16
-	if err := binary.Read(r.Reader, binary.LittleEndian, &payloadLength); err != nil {
+	var blockLength uint16
+	if err := binary.Read(r.Reader, binary.LittleEndian, &blockLength); err != nil {
 		return nil, err
 	}
 
-	header := &BaseBlockHeader{
-		CRC:           crc,
-		blockType:     blockType,
-		Flags:         flags,
-		payloadLength: payloadLength,
-	}
-
-	if flags&0x8000 == 0 {
-		return header, nil
-	}
-
-	var addLength uint32
-	if err := binary.Read(r.Reader, binary.LittleEndian, &addLength); err != nil {
-		return nil, err
-	}
-
-	return &LargeBlockHeader{
-		BaseBlockHeader: header,
-		addLength:       addLength,
+	return &BlockHeader{
+		CRC:         crc,
+		BlockType:   blockType,
+		Flags:       flags,
+		BlockLength: blockLength,
 	}, nil
 }
 
 // ReadBlockPayload reads payload content according to header block type
-func (r *SRR) ReadBlockPayload(header BlockHeader) (Block, error) {
-	switch header.BlockType() {
+func (r *SRR) ReadBlockPayload(header *BlockHeader) (Block, error) {
+	switch header.BlockType {
 	case BlockTypeSRRHeader:
 		return r.ReadHeaderBlock(header)
 	case BlockTypeFile:
 		return r.ReadFileBlock(header)
-	case BlockTypeRarFile:
-		return r.ReadRawBlock(header)
+	case BlockTypePackedFile:
+		return r.ReadPackedBlock(header)
 	default:
 		return r.ReadRawBlock(header)
 	}
 }
 
 // ReadHeaderBlock reads BlockTypeSRRHeader payload
-func (r *SRR) ReadHeaderBlock(header BlockHeader) (*HeaderBlock, error) {
+func (r *SRR) ReadHeaderBlock(header *BlockHeader) (*HeaderBlock, error) {
 	var appNameSize uint16
 	if err := binary.Read(r.Reader, binary.LittleEndian, &appNameSize); err != nil {
 		return nil, err
@@ -156,7 +143,14 @@ func (r *SRR) ReadHeaderBlock(header BlockHeader) (*HeaderBlock, error) {
 }
 
 // ReadFileBlock reads BlockTypeFile payload
-func (r *SRR) ReadFileBlock(header BlockHeader) (*FileBlock, error) {
+func (r *SRR) ReadFileBlock(header *BlockHeader) (*FileBlock, error) {
+	var payloadSize uint32
+	if header.Flags&0x8000 != 0 {
+		if err := binary.Read(r.Reader, binary.LittleEndian, &payloadSize); err != nil {
+			return nil, err
+		}
+	}
+
 	var filenameLength uint16
 	if err := binary.Read(r.Reader, binary.LittleEndian, &filenameLength); err != nil {
 		return nil, err
@@ -167,7 +161,7 @@ func (r *SRR) ReadFileBlock(header BlockHeader) (*FileBlock, error) {
 		return nil, err
 	}
 
-	payload := make([]byte, header.PayloadLength()-header.Length()-uint32(filenameLength)-2)
+	payload := make([]byte, payloadSize)
 	read, err := io.ReadFull(r.Reader, payload)
 	if err != nil {
 		return nil, err
@@ -184,9 +178,100 @@ func (r *SRR) ReadFileBlock(header BlockHeader) (*FileBlock, error) {
 	}, nil
 }
 
+// ReadPackedBlock reads BlockTypePackedFile payload
+func (r *SRR) ReadPackedBlock(header *BlockHeader) (*PackedBlock, error) {
+	var packedSize uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &packedSize); err != nil {
+		return nil, err
+	}
+
+	var unpackedSize uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &unpackedSize); err != nil {
+		return nil, err
+	}
+
+	os, err := r.Reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	var fileCRC uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &fileCRC); err != nil {
+		return nil, err
+	}
+
+	var timestamp uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &timestamp); err != nil {
+		return nil, err
+	}
+
+	rarVersion, err := r.Reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	method, err := r.Reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	var nameLength uint16
+	if err := binary.Read(r.Reader, binary.LittleEndian, &nameLength); err != nil {
+		return nil, err
+	}
+
+	var fileAttributes uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &fileAttributes); err != nil {
+		return nil, err
+	}
+
+	var highPackSize uint32
+	if header.Flags&0x100 > 0 {
+		if err := binary.Read(r.Reader, binary.LittleEndian, &highPackSize); err != nil {
+			return nil, err
+		}
+	}
+
+	var highUnpackSize uint32
+	if header.Flags&0x100 > 0 {
+		if err := binary.Read(r.Reader, binary.LittleEndian, &highUnpackSize); err != nil {
+			return nil, err
+		}
+	}
+
+	name := make([]byte, nameLength)
+	if err := binary.Read(r.Reader, binary.LittleEndian, name); err != nil {
+		return nil, err
+	}
+
+	salt := make([]byte, 8)
+	if header.Flags&0x400 > 0 {
+		if err := binary.Read(r.Reader, binary.LittleEndian, salt); err != nil {
+			return nil, err
+		}
+	}
+
+	if header.Flags&0x1000 > 0 {
+		return nil, fmt.Errorf("Flags & 0x1000")
+	}
+
+	return &PackedBlock{
+		BlockHeader:       header,
+		PackedSize:        uint64(highPackSize<<32 + packedSize),
+		UnpackedSize:      uint64(highUnpackSize<<32 + unpackedSize),
+		OS:                os,
+		FileCRC:           fileCRC,
+		Timestamp:         timestamp,
+		RARVersion:        rarVersion,
+		CompressionMethod: method,
+		Name:              string(name),
+		Salt:              salt,
+	}, nil
+}
+
 // ReadRawBlock reads any block type payload
-func (r *SRR) ReadRawBlock(header BlockHeader) (*RawBlock, error) {
-	payload := make([]byte, header.PayloadLength()-header.Length())
+func (r *SRR) ReadRawBlock(header *BlockHeader) (*RawBlock, error) {
+	payload := make([]byte, header.BlockLength-7)
 	read, err := io.ReadFull(r.Reader, payload)
 	if err != nil {
 		return nil, err
@@ -218,64 +303,16 @@ func (r *SRR) ReadAll() error {
 	}
 }
 
-// BlockHeader block header interface
-type BlockHeader interface {
-	String() string
-	Length() uint32
-	PayloadLength() uint32
-	BlockType() byte
+// BlockHeader common block header
+type BlockHeader struct {
+	CRC         uint16
+	BlockType   byte
+	Flags       uint16
+	BlockLength uint16
 }
 
-// BaseBlockHeader common block header
-type BaseBlockHeader struct {
-	CRC           uint16
-	blockType     byte
-	Flags         uint16
-	payloadLength uint16
-}
-
-// LargeBlockHeader block header with extended payload size
-type LargeBlockHeader struct {
-	*BaseBlockHeader
-	addLength uint32
-}
-
-func (bh *BaseBlockHeader) String() string {
-	return fmt.Sprintf("Block header type [0x%02X] - Payload size [%d] - Flags [0x%02X]", bh.BlockType(), bh.PayloadLength(), bh.Flags)
-}
-
-// Length returns block header size
-func (bh *BaseBlockHeader) Length() uint32 {
-	return 7
-}
-
-// PayloadLength returns total block size
-func (bh *BaseBlockHeader) PayloadLength() uint32 {
-	return uint32(bh.payloadLength)
-}
-
-// BlockType returns block type
-func (bh *BaseBlockHeader) BlockType() byte {
-	return bh.blockType
-}
-
-func (bh *LargeBlockHeader) String() string {
-	return fmt.Sprintf("Large block header type [0x%02X] - Payload size [%d] - Flags [0x%02X]", bh.BlockType(), bh.PayloadLength(), bh.Flags)
-}
-
-// Length returns block header size
-func (bh *LargeBlockHeader) Length() uint32 {
-	return 11
-}
-
-// PayloadLength returns total block size
-func (bh *LargeBlockHeader) PayloadLength() uint32 {
-	return uint32(bh.payloadLength) + bh.addLength
-}
-
-// BlockType returns block type
-func (bh *LargeBlockHeader) BlockType() byte {
-	return bh.blockType
+func (bh *BlockHeader) String() string {
+	return fmt.Sprintf("Block header type [0x%02X] - Payload size [%d] - Flags [0x%02X]", bh.BlockType, bh.BlockLength, bh.Flags)
 }
 
 // Block interface
@@ -285,20 +322,34 @@ type Block interface {
 
 // HeaderBlock is BlockTypeSRRHeader header + payload
 type HeaderBlock struct {
-	BlockHeader
+	*BlockHeader
 	AppName string
 }
 
 // FileBlock is BlockTypeFile header + payload
 type FileBlock struct {
-	BlockHeader
+	*BlockHeader
 	FileName string
 	Payload  []byte
 }
 
+// PackedBlock is BlockTypePackedFile header + payload
+type PackedBlock struct {
+	*BlockHeader
+	PackedSize        uint64
+	UnpackedSize      uint64
+	OS                byte
+	FileCRC           uint32
+	Timestamp         uint32
+	RARVersion        byte
+	CompressionMethod byte
+	Name              string
+	Salt              []byte
+}
+
 // RawBlock is any block type header + payload
 type RawBlock struct {
-	BlockHeader
+	*BlockHeader
 	Payload []byte
 }
 
@@ -308,6 +359,10 @@ func (b *HeaderBlock) String() string {
 
 func (b *FileBlock) String() string {
 	return fmt.Sprintf("FileBlock - Header: %s - Filename: %s", b.BlockHeader, b.FileName)
+}
+
+func (b *PackedBlock) String() string {
+	return fmt.Sprintf("PackedBlock - Header: %s - Filename: %s", b.BlockHeader, b.Name)
 }
 
 func (b *RawBlock) String() string {
