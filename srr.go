@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 )
 
 // SRR archive block types enum
@@ -23,32 +22,21 @@ const (
 	BlockTypeRarEnd     = 0x7B
 )
 
-// New bufferize file, and check for known header existence
-func New(f *os.File) (*SRR, error) {
-	fi, err := f.Stat()
+// New adds buffer to reader and check for known header existence
+func New(f io.Reader) (*SRR, error) {
+	srr := &SRR{
+		Reader: bufio.NewReader(f),
+	}
+
+	// Peek at first block
+	fileHeader, err := srr.Reader.Peek(3)
 	if err != nil {
 		return nil, err
 	}
 
-	size := fi.Size()
-	if size < 20 {
-		return nil, errors.New("File is too small, minimum archive size is 20 bytes")
-	}
-
-	srr := &SRR{
-		Reader:   bufio.NewReader(f),
-		Filesize: size,
-	}
-
-	// Peek at first block
-	header, err := srr.ReadBlockHeader()
-	if header.BlockType != BlockTypeSRRHeader {
+	if fileHeader[2] != BlockTypeSRRHeader {
 		return nil, errors.New("File is not a valid SRR archive")
 	}
-
-	// Reset reader
-	f.Seek(0, io.SeekStart)
-	srr.Reader.Reset(f)
 
 	return srr, nil
 }
@@ -117,6 +105,8 @@ func (r *SRR) ReadBlockPayload(header *BlockHeader) (Block, error) {
 		return r.ReadHeaderBlock(header)
 	case BlockTypeFile:
 		return r.ReadFileBlock(header)
+	case BlockTypePadding:
+		return r.ReadPaddingBlock(header)
 	case BlockTypePackedFile:
 		return r.ReadPackedBlock(header)
 	default:
@@ -178,6 +168,30 @@ func (r *SRR) ReadFileBlock(header *BlockHeader) (*FileBlock, error) {
 	}, nil
 }
 
+// ReadPaddingBlock reads BlockTypePadding payload
+func (r *SRR) ReadPaddingBlock(header *BlockHeader) (*PadBlock, error) {
+	var payloadSize uint32
+	if header.Flags&0x8000 != 0 {
+		if err := binary.Read(r.Reader, binary.LittleEndian, &payloadSize); err != nil {
+			return nil, err
+		}
+	}
+
+	payload := make([]byte, payloadSize)
+	read, err := io.ReadFull(r.Reader, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(payload) != read {
+		return nil, fmt.Errorf("Payload : expected [%d], got [%d]", len(payload), read)
+	}
+
+	return &PadBlock{
+		BlockHeader: header,
+	}, nil
+}
+
 // ReadPackedBlock reads BlockTypePackedFile payload
 func (r *SRR) ReadPackedBlock(header *BlockHeader) (*PackedBlock, error) {
 	var packedSize uint32
@@ -200,8 +214,8 @@ func (r *SRR) ReadPackedBlock(header *BlockHeader) (*PackedBlock, error) {
 		return nil, err
 	}
 
-	var timestamp uint32
-	if err := binary.Read(r.Reader, binary.LittleEndian, &timestamp); err != nil {
+	var datetime uint32
+	if err := binary.Read(r.Reader, binary.LittleEndian, &datetime); err != nil {
 		return nil, err
 	}
 
@@ -252,21 +266,57 @@ func (r *SRR) ReadPackedBlock(header *BlockHeader) (*PackedBlock, error) {
 	}
 
 	if header.Flags&0x1000 > 0 {
-		return nil, fmt.Errorf("Flags & 0x1000")
+		var timeFlags uint16
+		if err := binary.Read(r.Reader, binary.LittleEndian, &timeFlags); err != nil {
+			return nil, err
+		}
+
+		if _, err := parseXTime(r.Reader, timeFlags>>12, datetime); err != nil {
+			return nil, err
+		}
+		if _, err := parseXTime(r.Reader, timeFlags>>8, 0); err != nil {
+			return nil, err
+		}
+		if _, err := parseXTime(r.Reader, timeFlags>>4, 0); err != nil {
+			return nil, err
+		}
+		if _, err := parseXTime(r.Reader, timeFlags>>0, 0); err != nil {
+			return nil, err
+		}
 	}
 
 	return &PackedBlock{
 		BlockHeader:       header,
-		PackedSize:        uint64(highPackSize<<32 + packedSize),
-		UnpackedSize:      uint64(highUnpackSize<<32 + unpackedSize),
+		PackedSize:        uint64(uint64(highPackSize)<<32 + uint64(packedSize)),
+		UnpackedSize:      uint64(uint64(highUnpackSize)<<32 + uint64(unpackedSize)),
 		OS:                os,
 		FileCRC:           fileCRC,
-		Timestamp:         timestamp,
+		Datetime:          datetime,
 		RARVersion:        rarVersion,
 		CompressionMethod: method,
-		Name:              string(name),
+		FileName:          string(name),
 		Salt:              salt,
 	}, nil
+}
+
+func parseXTime(r *bufio.Reader, flags uint16, datetime uint32) (uint32, error) {
+	if flags&0x8 == 0 {
+		return datetime, nil
+	}
+
+	if datetime == 0 {
+		if err := binary.Read(r, binary.LittleEndian, &datetime); err != nil {
+			return 0, err
+		}
+	}
+
+	rem := make([]byte, flags&0x3)
+	if err := binary.Read(r, binary.LittleEndian, rem); err != nil {
+		return 0, err
+	}
+
+	// Ignore for now
+	return 0, nil
 }
 
 // ReadRawBlock reads any block type payload
@@ -312,7 +362,7 @@ type BlockHeader struct {
 }
 
 func (bh *BlockHeader) String() string {
-	return fmt.Sprintf("Block header type [0x%02X] - Payload size [%d] - Flags [0x%02X]", bh.BlockType, bh.BlockLength, bh.Flags)
+	return fmt.Sprintf("Block type [0x%02X] - Payload size [%d] - Flags [0x%02X]", bh.BlockType, bh.BlockLength, bh.Flags)
 }
 
 // Block interface
@@ -333,6 +383,11 @@ type FileBlock struct {
 	Payload  []byte
 }
 
+// PadBlock is BlockTypePadding header + payload
+type PadBlock struct {
+	*BlockHeader
+}
+
 // PackedBlock is BlockTypePackedFile header + payload
 type PackedBlock struct {
 	*BlockHeader
@@ -340,10 +395,10 @@ type PackedBlock struct {
 	UnpackedSize      uint64
 	OS                byte
 	FileCRC           uint32
-	Timestamp         uint32
+	Datetime          uint32
 	RARVersion        byte
 	CompressionMethod byte
-	Name              string
+	FileName          string
 	Salt              []byte
 }
 
@@ -354,17 +409,21 @@ type RawBlock struct {
 }
 
 func (b *HeaderBlock) String() string {
-	return fmt.Sprintf("HeaderBlock - Header: %s - AppName: %s", b.BlockHeader, b.AppName)
+	return fmt.Sprintf("HeaderBlock - %s - AppName: %s", b.BlockHeader, b.AppName)
 }
 
 func (b *FileBlock) String() string {
-	return fmt.Sprintf("FileBlock - Header: %s - Filename: %s", b.BlockHeader, b.FileName)
+	return fmt.Sprintf("FileBlock - %s - Filename: %s", b.BlockHeader, b.FileName)
+}
+
+func (b *PadBlock) String() string {
+	return fmt.Sprintf("PadBlock - %s", b.BlockHeader)
 }
 
 func (b *PackedBlock) String() string {
-	return fmt.Sprintf("PackedBlock - Header: %s - Filename: %s", b.BlockHeader, b.Name)
+	return fmt.Sprintf("PackedBlock - %s - Filename: %s", b.BlockHeader, b.FileName)
 }
 
 func (b *RawBlock) String() string {
-	return fmt.Sprintf("RawBlock - Header: %s - Payload length: %d", b.BlockHeader, len(b.Payload))
+	return fmt.Sprintf("RawBlock - %s - Payload length: %d", b.BlockHeader, len(b.Payload))
 }
